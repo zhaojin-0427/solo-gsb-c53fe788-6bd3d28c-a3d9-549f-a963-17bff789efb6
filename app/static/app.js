@@ -597,7 +597,7 @@ $("#loadDemoBtn").addEventListener("click", async () => {
       ann(a2, org, "北京"),
       ann(a1, org, "华科"),
       ann(a2, org, "华科"),
-      ann(a3, org, "华科团队", 4),          // 与华科[18,20) 交叉（无嵌套规则）
+      ann(a3, org, "华科", 4),              // 丙把「华科团队」[29,33) 标成 ORG：与华科[29,31) 同标签相交
     ];
     // 两条 EVENT：合法长区间，内部严格包含 PERSON 与 TIME（演示嵌套共存）
     const span = (w, len) => [off[w], off[w] + (len ?? w.length)];

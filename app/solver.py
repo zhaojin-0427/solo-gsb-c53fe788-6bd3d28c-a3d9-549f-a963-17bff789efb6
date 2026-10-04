@@ -4,11 +4,17 @@
 嵌套/互斥规则，求出总得分最大的候选区间子集。
 
 评分方式（参数化，快照进报告）：
-    每个候选 = 一条输入标注的 (start, end, label) 去重。
-    候选得分 = Σ 标注者权重 × 标签一致系数(label_match_weight)
-               × 区间重叠比例(overlap_ratio)
+    候选 = 输入标注按 (start, end, label) 去重。
+    候选得分 = Σ 支持者的整数贡献；支持者 = 所有与候选「同标签且区间
+               相交（Dice 重叠比 > 0）」的输入标注——同一条标注可支持
+               多个候选，异标签或零重叠一律不计分：
+        贡献 = 标注者权重 × quantize(标签一致系数 × Dice 重叠比例)
     重叠比例采用对称的 Sørensen–Dice 系数：
         overlap_ratio = 2 * |A∩B| / (|A| + |B|)
+    量化 quantize(x) = floor(x * SCORE_SCALE + 0.5) 把系数映射到
+    0..SCORE_SCALE 的整数，与整数权重相乘后每位支持者的贡献都是整数，
+    候选得分即各贡献之和 —— CP-SAT 目标无需浮点，且与页面/报告展示的
+    支持者明细逐分一致。
 
 约束：
     * 同一候选区间至多取一次；
@@ -28,10 +34,11 @@ from typing import Any
 from ortools.sat.python import cp_model
 
 ALGORITHM_NAME = "adj-cpsat-consensus"
-ALGORITHM_VERSION = "1.0.0"
+ALGORITHM_VERSION = "1.1.0"
 
-# 得分放大倍数：权重 1..10 的整数与 Dice 系数（一位小数量化）
-# 相乘后仍为整数，CP-SAT 只处理整数目标。
+# 得分整数映射：Dice 重叠比（可乘标签一致系数）量化到 0..SCORE_SCALE
+# 的整数后再乘整数权重，每位支持者的贡献都是整数；候选得分 = 各支持者
+# 整数贡献之和，CP-SAT 只处理整数目标。
 SCORE_SCALE = 10
 # 默认标签不一致时的系数（本应用候选带标签，实际只聚合同标签支持）。
 DEFAULT_LABEL_MATCH_WEIGHT = 1.0
@@ -124,28 +131,37 @@ def solve_consensus(
     force_selected_keys = force_selected_keys or set()
     force_deselected_keys = force_deselected_keys or set()
 
-    # ---- 1. 聚合候选 -----------------------------------------------------
-    grouped: dict[tuple[int, int, int], dict[str, Any]] = {}
+    # ---- 1. 候选去重 + 支持者汇集 --------------------------------------
+    # 候选集合保持按输入区间与标签去重：(start, end, label_id)。
+    label_names: dict[int, str] = {}
+    cand_keys: set[tuple[int, int, int]] = set()
     for ann in annotations:
-        key = (ann.start, ann.end, ann.label_id)
-        bucket = grouped.setdefault(
-            key, {"label_name": ann.label_name, "supporters": []}
-        )
-        bucket["supporters"].append(ann)
+        cand_keys.add((ann.start, ann.end, ann.label_id))
+        label_names.setdefault(ann.label_id, ann.label_name)
 
     ordered_keys = sorted(
-        grouped.keys(), key=lambda k: (k[0], k[1], grouped[k]["label_name"], k[2])
+        cand_keys, key=lambda k: (k[0], k[1], label_names[k[2]], k[2])
     )
 
     candidates: list[Candidate] = []
     for i, key in enumerate(ordered_keys):
         start, end, label_id = key
-        bucket = grouped[key]
-        score = 0.0
+        score = 0
         supporters: list[dict[str, Any]] = []
-        for ann in bucket["supporters"]:
+        # 支持者 = 所有「同标签且区间相交（Dice 重叠比 > 0）」的输入标注，
+        # 不要求起止完全相同；同一条标注可支持多个候选，
+        # 异标签或零重叠一律不计分。
+        for ann in annotations:
+            if ann.label_id != label_id:
+                continue
             ratio = dice_overlap(start, end, ann.start, ann.end)
-            contribution = ann.weight * params.label_match_weight * ratio
+            if ratio <= 0.0:
+                continue
+            # 整数得分映射：重叠比（乘标签一致系数）量化到 0..SCORE_SCALE
+            # 后与整数权重相乘，每位支持者的贡献都是整数，候选得分即各
+            # 贡献之和 —— 与页面/报告展示的明细严格一致。
+            quantized = quantize_overlap(params.label_match_weight * ratio)
+            contribution = ann.weight * quantized
             score += contribution
             supporters.append(
                 {
@@ -155,7 +171,7 @@ def solve_consensus(
                     "start": ann.start,
                     "end": ann.end,
                     "overlap_ratio": round(ratio, 4),
-                    "contribution": round(contribution, 4),
+                    "contribution": round(contribution / SCORE_SCALE, 4),
                 }
             )
         candidates.append(
@@ -164,9 +180,9 @@ def solve_consensus(
                 start=start,
                 end=end,
                 label_id=label_id,
-                label_name=bucket["label_name"],
-                score=int(math.floor(score * SCORE_SCALE + 0.5)),
-                raw_score=round(score, 4),
+                label_name=label_names[label_id],
+                score=score,
+                raw_score=round(score / SCORE_SCALE, 4),
                 supporters=supporters,
             )
         )

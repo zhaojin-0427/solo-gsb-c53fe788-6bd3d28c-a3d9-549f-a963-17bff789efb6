@@ -155,3 +155,51 @@ def test_report_immutable(setup):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM reports WHERE version=?", (version,))
     conn.close()
+
+
+def test_partial_overlap_scoring_end_to_end():
+    """同标签、边界不同但相交的标注互相贡献分数；共识页与报告数据一致。"""
+    pid = client.post("/api/projects", json={"name": "partial-overlap"}).json()["id"]
+    client.post(f"/api/projects/{pid}/documents",
+                json={"doc_id": "d1", "content": "ABCDEFGHIJ"})
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENTITY"}).json()["id"]
+    a1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "甲", "weight": 8}).json()["id"]
+    a2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "乙", "weight": 5}).json()["id"]
+    # 同标签、边界不同但相交的合法区间（按单字符词元，端点均对齐）
+    for who, s, e in [(a1, 0, 4), (a2, 0, 6)]:
+        r = client.post(f"/api/projects/{pid}/documents/d1/annotations",
+                        json={"annotator_id": who, "label_id": lab,
+                              "start": s, "end": e})
+        assert r.status_code == 201, r.text
+
+    con = client.post(f"/api/projects/{pid}/documents/d1/consensus", json={}).json()
+    items = {(i["start"], i["end"]): i for i in con["items"]}
+    short, long_ = items[(0, 4)], items[(0, 6)]
+    # dice([0,4),[0,6)) = 0.8 -> 量化 8/10；双方都获得部分重叠支持
+    assert short["score"] == 8 * 10 + 5 * 8
+    assert long_["score"] == 5 * 10 + 8 * 8
+    assert {s["annotator_id"] for s in short["supporters"]} == {a1, a2}
+    assert {s["annotator_id"] for s in long_["supporters"]} == {a1, a2}
+    # 明细贡献之和 = 候选得分（页面/报告展示一致）
+    for it in (short, long_):
+        assert sum(s["contribution"] for s in it["supporters"]) == \
+            pytest.approx(it["raw_score"])
+    # 同标签相交互斥：总分高者被采纳
+    assert short["adopted"] is True and long_["adopted"] is False
+    assert con["total_score"] == short["score"]
+    assert con["params"]["score_scale"] == 10
+    assert con["algorithm_version"]
+
+    # 报告与共识页数据一致，且带实际算法参数与版本
+    rep = client.post(
+        f"/api/projects/{pid}/consensuses/{con['id']}/report", json={}).json()
+    assert rep["solver"]["total_score"] == con["total_score"]
+    assert rep["algorithm"]["version"] == con["algorithm_version"]
+    assert rep["parameters"] == con["params"]
+    rep_short = next(i for i in rep["consensus"]["all_items"]
+                     if (i["start"], i["end"]) == (0, 4))
+    assert rep_short["score"] == short["score"]
+    assert rep_short["supporters"] == short["supporters"]

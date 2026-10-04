@@ -221,6 +221,8 @@ def persist_consensus(conn, project_id: int, snapshot, params: SolveParams,
                 "respect_overrides": params.respect_overrides,
                 "score_scale": SCORE_SCALE,
                 "overlap_ratio": "2*intersection/(|A|+|B|) (Sorensen-Dice)",
+                "supporter_rule": "same label_id and dice_overlap>0; "
+                                  "contribution=weight*quantize(label_match_weight*dice)",
                 "tie_break": "lexicographic by (start,end,label_name,label_id)",
             }),
             db.dumps(snapshot),

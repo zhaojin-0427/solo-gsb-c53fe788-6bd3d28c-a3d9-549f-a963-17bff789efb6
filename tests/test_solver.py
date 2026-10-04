@@ -1,4 +1,6 @@
 """求解器单元测试：评分、约束、平分确定性、覆盖可行性。"""
+import pytest
+
 from app.solver import (
     InputAnnotation,
     SolveParams,
@@ -101,3 +103,79 @@ def test_conflicting_overrides_infeasible():
         force_deselected_keys={(0, 2, 1)},
     )
     assert res.status not in ("OPTIMAL", "FEASIBLE")
+
+
+def test_partial_overlap_same_label_contributes():
+    # 同标签、边界不同但相交的标注互相为对方候选贡献分数
+    annotations = [
+        ann(1, 0, 4, 1, 8),
+        ann(2, 0, 6, 1, 5),
+        ann(3, 10, 12, 1, 3),   # 零重叠：不得计入
+    ]
+    res = solve_consensus(annotations, set(), set())
+    by = {(c.start, c.end): c for c in res.candidates}
+    short, long_ = by[(0, 4)], by[(0, 6)]
+    # dice([0,4),[0,6)) = 2*4/(4+6) = 0.8 -> 量化 8/10
+    assert short.score == 8 * 10 + 5 * 8      # 自身 1.0 + 部分重叠 0.8
+    assert long_.score == 5 * 10 + 8 * 8
+    assert short.raw_score == 12.0
+    # 同一标注可支持多个候选
+    assert {s["annotator_id"] for s in short.supporters} == {1, 2}
+    assert {s["annotator_id"] for s in long_.supporters} == {1, 2}
+    # 明细贡献之和与候选得分严格一致（整数映射）
+    for c in (short, long_):
+        assert sum(s["contribution"] for s in c.supporters) == \
+            pytest.approx(c.raw_score)
+    # 同标签相交 => 至多取一，总分高者胜
+    assert res.chosen[short.index] is True
+    assert res.chosen[long_.index] is False
+
+
+def test_cross_label_and_zero_overlap_never_score():
+    annotations = [
+        ann(1, 0, 4, 1, 8),
+        ann(2, 0, 6, 2, 10),   # 异标签相交：不计分
+        ann(3, 4, 8, 1, 10),   # 同标签但端点相接（零重叠）：不计分
+    ]
+    res = solve_consensus(annotations, set(), set())
+    by = {(c.start, c.end, c.label_id): c for c in res.candidates}
+    c = by[(0, 4, 1)]
+    assert [s["annotator_id"] for s in c.supporters] == [1]
+    assert c.score == 8 * 10
+    assert by[(0, 6, 2)].score == 10 * 10
+    assert by[(4, 8, 1)].score == 10 * 10
+
+
+def test_one_annotation_supports_multiple_candidates():
+    # 一条长区间标注同时支持多个同标签相交候选
+    annotations = [
+        ann(1, 0, 10, 1, 6),
+        ann(2, 2, 4, 1, 5),
+        ann(3, 6, 8, 1, 5),
+    ]
+    res = solve_consensus(annotations, set(), set())
+    by = {(c.start, c.end): c for c in res.candidates}
+    outer, inner_a, inner_b = by[(0, 10)], by[(2, 4)], by[(6, 8)]
+    assert {s["annotator_id"] for s in outer.supporters} == {1, 2, 3}
+    assert 1 in {s["annotator_id"] for s in inner_a.supporters}
+    assert 1 in {s["annotator_id"] for s in inner_b.supporters}
+    # dice([0,10),[2,4)) = 4/12 -> 量化 3/10
+    assert outer.score == 6 * 10 + 5 * 3 + 5 * 3
+    assert inner_a.score == 5 * 10 + 6 * 3
+    # 两个内层互不重叠可共存（68+68=136），优于独占的外层（90）
+    assert res.chosen[outer.index] is False
+    assert res.chosen[inner_a.index] is True
+    assert res.chosen[inner_b.index] is True
+    assert res.total_score == inner_a.score + inner_b.score
+
+
+def test_integer_mapping_quantizes_each_supporter():
+    # dice=0.25 -> round-half-up 量化 0.3，贡献 = 权重 × 3（而非四舍五入总分）
+    annotations = [ann(1, 0, 4, 1, 5), ann(2, 3, 7, 1, 6)]
+    res = solve_consensus(annotations, set(), set())
+    by = {(c.start, c.end): c for c in res.candidates}
+    # dice([0,4),[3,7)) = 2*1/(4+4) = 0.25 -> 3/10
+    assert by[(0, 4)].score == 5 * 10 + 6 * 3
+    assert by[(3, 7)].score == 6 * 10 + 5 * 3
+    assert by[(0, 4)].supporters[1]["contribution"] == 1.8
+    assert by[(0, 4)].supporters[1]["overlap_ratio"] == 0.25
