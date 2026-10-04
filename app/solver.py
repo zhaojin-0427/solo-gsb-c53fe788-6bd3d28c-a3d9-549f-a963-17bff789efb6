@@ -5,10 +5,16 @@
 
 评分方式（参数化，快照进报告）：
     每个候选 = 一条输入标注的 (start, end, label) 去重。
+    候选支持者 = 所有与候选「同标签且区间相交」的输入标注
+        （同一标注可支持多个候选；异标签或零重叠的标注不计分）。
     候选得分 = Σ 标注者权重 × 标签一致系数(label_match_weight)
-               × 区间重叠比例(overlap_ratio)
+               × 量化重叠比例 quantize(overlap_ratio)
     重叠比例采用对称的 Sørensen–Dice 系数：
         overlap_ratio = 2 * |A∩B| / (|A| + |B|)
+    量化：quantize(r) = round(r × SCORE_SCALE)，得到 0..SCORE_SCALE
+    的整数；权重 1..10 也是整数，因此候选得分是**精确整数**，直接
+    作为 CP-SAT 整数目标；展示分 = 整数得分 / SCORE_SCALE，与逐位
+    支持者的贡献分之和严格一致。
 
 约束：
     * 同一候选区间至多取一次；
@@ -28,7 +34,7 @@ from typing import Any
 from ortools.sat.python import cp_model
 
 ALGORITHM_NAME = "adj-cpsat-consensus"
-ALGORITHM_VERSION = "1.0.0"
+ALGORITHM_VERSION = "1.1.0"
 
 # 得分放大倍数：权重 1..10 的整数与 Dice 系数（一位小数量化）
 # 相乘后仍为整数，CP-SAT 只处理整数目标。
@@ -125,28 +131,31 @@ def solve_consensus(
     force_deselected_keys = force_deselected_keys or set()
 
     # ---- 1. 聚合候选 -----------------------------------------------------
-    grouped: dict[tuple[int, int, int], dict[str, Any]] = {}
+    # 候选 = 输入标注按 (start, end, label) 去重；
+    # 候选的支持者 = 所有与候选同标签且区间相交（Dice 量化后 > 0）的
+    # 输入标注——同一标注可支持多个候选；异标签或零重叠不计分。
+    grouped: dict[tuple[int, int, int], str] = {}
+    by_label: dict[int, list[InputAnnotation]] = {}
     for ann in annotations:
-        key = (ann.start, ann.end, ann.label_id)
-        bucket = grouped.setdefault(
-            key, {"label_name": ann.label_name, "supporters": []}
-        )
-        bucket["supporters"].append(ann)
+        grouped.setdefault((ann.start, ann.end, ann.label_id), ann.label_name)
+        by_label.setdefault(ann.label_id, []).append(ann)
 
     ordered_keys = sorted(
-        grouped.keys(), key=lambda k: (k[0], k[1], grouped[k]["label_name"], k[2])
+        grouped.keys(), key=lambda k: (k[0], k[1], grouped[k], k[2])
     )
 
     candidates: list[Candidate] = []
     for i, key in enumerate(ordered_keys):
         start, end, label_id = key
-        bucket = grouped[key]
-        score = 0.0
+        units_total = 0  # 整数得分单元：Σ 权重 × 量化重叠比（精确整数）
         supporters: list[dict[str, Any]] = []
-        for ann in bucket["supporters"]:
+        for ann in by_label.get(label_id, []):
             ratio = dice_overlap(start, end, ann.start, ann.end)
-            contribution = ann.weight * params.label_match_weight * ratio
-            score += contribution
+            q = quantize_overlap(ratio)
+            if q <= 0:
+                continue  # 零重叠（或量化后为 0）不计分
+            units = ann.weight * q
+            units_total += units
             supporters.append(
                 {
                     "annotator_id": ann.annotator_id,
@@ -154,19 +163,23 @@ def solve_consensus(
                     "weight": ann.weight,
                     "start": ann.start,
                     "end": ann.end,
-                    "overlap_ratio": round(ratio, 4),
-                    "contribution": round(contribution, 4),
+                    "overlap_ratio": round(q / SCORE_SCALE, 4),
+                    "contribution": round(
+                        units * params.label_match_weight / SCORE_SCALE, 4
+                    ),
                 }
             )
+        supporters.sort(key=lambda s: (s["annotator_id"], s["start"], s["end"]))
+        score = int(math.floor(units_total * params.label_match_weight + 0.5))
         candidates.append(
             Candidate(
                 index=i,
                 start=start,
                 end=end,
                 label_id=label_id,
-                label_name=bucket["label_name"],
-                score=int(math.floor(score * SCORE_SCALE + 0.5)),
-                raw_score=round(score, 4),
+                label_name=grouped[key],
+                score=score,
+                raw_score=round(score / SCORE_SCALE, 4),
                 supporters=supporters,
             )
         )

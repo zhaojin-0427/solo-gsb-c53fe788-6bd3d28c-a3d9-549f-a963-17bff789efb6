@@ -424,10 +424,18 @@ function supporterLine(s) {
 function renderConsensus() {
   const c = state.consensus;
   $("#openReportLink").classList.add("hidden");
-  if (!c) return;
+  if (!c) {
+    $("#solveParams").classList.add("hidden");
+    return;
+  }
   $("#solveMeta").textContent =
     `共识 #${c.id} · 算法 ${c.algorithm_name} v${c.algorithm_version} · ` +
     `${c.solver_status} · 总分 ${c.raw_total_score} · ${c.created_at}`;
+  $("#solveParams").classList.remove("hidden");
+  $("#solveParamsJson").textContent = JSON.stringify({
+    algorithm: `${c.algorithm_name} v${c.algorithm_version}`,
+    ...c.params,
+  }, null, 2);
 
   const adopted = c.items.filter((i) => i.adopted);
   const rejected = c.items.filter((i) => !i.adopted);

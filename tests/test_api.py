@@ -155,3 +155,60 @@ def test_report_immutable(setup):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM reports WHERE version=?", (version,))
     conn.close()
+
+
+def test_partial_overlap_scoring_end_to_end():
+    """同标签、边界不同但相交的标注：部分重叠支持计入得分，
+    共识页明细与报告中的贡献/得分/算法参数一致。"""
+    pid = client.post("/api/projects", json={"name": "partial-overlap"}).json()["id"]
+    bounds = [[i, i + 1] for i in range(8)]
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d1", "content": "abcdefgh", "token_bounds": bounds})
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENTITY", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "甲", "weight": 10}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "乙", "weight": 8}).json()["id"]
+    u3 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "丙", "weight": 6}).json()["id"]
+    for who, s, e in [(u1, 0, 4), (u2, 2, 6), (u3, 3, 5)]:
+        r = client.post(f"/api/projects/{pid}/documents/d1/annotations", json={
+            "annotator_id": who, "label_id": lab, "start": s, "end": e})
+        assert r.status_code == 201, r.text
+
+    con = client.post(f"/api/projects/{pid}/documents/d1/consensus", json={}).json()
+    items = {(i["start"], i["end"]): i for i in con["items"]}
+    # 候选仍按 (start,end,label) 去重：3 个候选
+    assert len(con["items"]) == 3
+    # 逐支持者量化计分（dice 0.5→0.5, 1/3→0.3, 2/3→0.7）
+    assert items[(0, 4)]["score"] == 158
+    assert items[(2, 6)]["score"] == 172
+    assert items[(3, 5)]["score"] == 146
+    # 部分重叠支持使 [2,6) 反超 [0,4)
+    assert items[(2, 6)]["adopted"] is True
+    assert items[(0, 4)]["adopted"] is False
+    # 同一标注支持多个候选；Σ贡献 = 展示分；整数目标 = 展示分 × scale
+    for it in con["items"]:
+        assert len(it["supporters"]) == 3
+        assert abs(sum(s["contribution"] for s in it["supporters"])
+                   - it["raw_score"]) < 1e-9
+        assert abs(it["raw_score"] * 10 - it["score"]) < 1e-9
+    assert con["raw_total_score"] == 17.2
+    # 实际算法参数与版本随共识返回
+    assert con["algorithm_version"]
+    assert con["params"]["score_scale"] == 10
+    assert "quantize" in con["params"]["contribution"]
+
+    # 报告与共识页一致：同样的得分、支持者贡献、参数与版本
+    rep = client.post(
+        f"/api/projects/{pid}/consensuses/{con['id']}/report", json={}).json()
+    assert rep["algorithm"]["version"] == con["algorithm_version"]
+    assert rep["parameters"] == con["params"]
+    assert rep["solver"]["raw_total_score"] == con["raw_total_score"]
+    adopted = rep["consensus"]["adopted"]
+    assert len(adopted) == 1 and (adopted[0]["start"], adopted[0]["end"]) == (2, 6)
+    assert adopted[0]["score"] == 172
+    assert {s["annotator_name"] for s in adopted[0]["supporters"]} == {"甲", "乙", "丙"}
+    assert abs(sum(s["contribution"] for s in adopted[0]["supporters"])
+               - adopted[0]["raw_score"]) < 1e-9
